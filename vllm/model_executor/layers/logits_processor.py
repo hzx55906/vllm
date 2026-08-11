@@ -59,6 +59,9 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        self.enable_reduce_sample = (
+            model_config.enable_reduce_sample if model_config is not None else False
+        )
 
     def forward(
         self,
@@ -143,13 +146,20 @@ class LogitsProcessor(PluggableLayer):
         # Get the logits for the next tokens.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
 
-        # Gather logits for TP
-        if lm_head.tp_size > 1:
+        # Gather logits for TP.
+        # When enable_reduce_sample is active, skip the all-gather so each
+        # TP rank keeps its shard-local logits [B, V_local]. The downstream
+        # sampler performs a reduced-communication top-k + gather instead.
+        if lm_head.tp_size > 1 and not self.enable_reduce_sample:
             logits = self._gather_logits(logits)
 
         # Remove paddings in vocab (if any).
         if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
+            if self.enable_reduce_sample and lm_head.tp_size > 1:
+                # Use the local shard size (without padding) for truncation.
+                logits = logits[..., : lm_head.shard_indices.num_org_elements]
+            else:
+                logits = logits[..., : self.org_vocab_size]
         return logits
 
     def get_top_tokens(

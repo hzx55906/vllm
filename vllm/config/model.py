@@ -259,6 +259,11 @@ class ModelConfig:
     equivalent exponential-race sampling. FP64 preserves lower-tail sampling
     events that fp32 uniform/exponential draws can truncate, at the cost of
     significantly lower throughput on most GPUs."""
+    enable_reduce_sample: bool = False
+    """Whether to use reduced sampling for tensor-parallel inference. Instead of
+    all-gathering the full vocabulary logits across TP ranks, each rank performs
+    local top-k on its vocab shard and all-gathers only the k values + indices,
+    reducing communication from O(V) to O(k)."""
     disable_sliding_window: bool = False
     """Whether to disable sliding window. If True, we will disable the sliding
     window functionality of the model, capping to sliding window size. If the
@@ -420,6 +425,7 @@ class ModelConfig:
             "enforce_eager",
             "logprobs_mode",
             "use_fp64_gumbel",
+            "enable_reduce_sample",
             "disable_cascade_attn",
             "skip_tokenizer_init",
             "served_model_name",

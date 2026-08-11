@@ -6,6 +6,12 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -26,6 +32,8 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
+logger = init_logger(__name__)
+
 
 class Sampler:
     def __init__(
@@ -37,10 +45,14 @@ class Sampler:
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
+        enable_reduce_sample: bool = False,
     ):
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
+        self.enable_reduce_sample = enable_reduce_sample
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         self.req_states = req_states
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
@@ -50,6 +62,15 @@ class Sampler:
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
+
+        if enable_reduce_sample and self.tp_size > 1:
+            logger.info_once(
+                "Reduced sampling is enabled for tensor-parallel inference "
+                "(tp_size=%d). Each TP rank will perform local top-k and "
+                "all-gather only the candidate values + indices instead of "
+                "the full vocabulary logits.",
+                self.tp_size,
+            )
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -215,6 +236,99 @@ class Sampler:
             return True
         return bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
 
+    # ------------------------------------------------------------------
+    # Reduced sampling (tensor-parallel optimized)
+    # ------------------------------------------------------------------
+
+    def _reduce_sample(
+        self,
+        local_logits: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel sampling via local top-k + TP all-gather.
+
+        Each TP rank selects its top-k logits locally, all-gathers only those
+        k values + global indices, then reuses ``apply_top_k_top_p`` and
+        ``gumbel_sample`` on the reduced candidate set (treated as a "small
+        vocabulary"). Communication: O(B * 2 * k * tp_size) instead of
+        O(B * V).
+
+        The same ``gumbel_sample`` path serves all-greedy, mixed, and
+        all-random batches: greedy rows (temperature=0) skip Gumbel noise
+        inside the kernel, falling back to plain argmax. ``all_greedy`` only
+        affects ``k_for_topk`` (1 vs. user top_k) to minimize communication.
+
+        Args:
+            local_logits: Shard-local logits [num_tokens, V_local] (after
+                temperature, penalties, etc. have been applied).
+            top_k: Per-token top_k values [num_tokens] or None.
+            top_p: Per-token top_p values [num_tokens] or None.
+            expanded_idx_mapping: [num_tokens] mapping to request state idx.
+            idx_mapping_np: [num_tokens] numpy mapping (for GPU-sync-free
+                access to sampling states).
+            temperature: [max_num_reqs] per-request temperature.
+            seeds: [max_num_reqs] per-request random seeds.
+            pos: [num_tokens] position within request (for RNG seeding).
+
+        Returns:
+            Sampled global token IDs [num_tokens].
+        """
+        _, V_local = local_logits.shape
+
+        # All ranks must use the same k so all-gather shapes match.
+        # Use numpy to avoid GPU-CPU synchronization.
+        temps = self.sampling_states.temperature.np[idx_mapping_np]
+        all_greedy = not np.any(temps != 0.0)
+        if all_greedy:
+            k_for_topk = 1
+        elif top_k is not None:
+            k_for_topk = min(
+                int(self.sampling_states.top_k.np[idx_mapping_np].max()), V_local
+            )
+        else:
+            k_for_topk = V_local
+        k_for_topk = max(k_for_topk, 1)
+
+        # Local top-k + global index mapping.
+        local_vals, local_idx = torch.topk(local_logits, k=k_for_topk, dim=-1)
+        local_global_idx = local_idx + self.tp_rank * V_local
+
+        # All-gather only candidates.
+        gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+        gathered_idx = tensor_model_parallel_all_gather(local_global_idx, dim=-1)
+
+        # Reuse apply_top_k_top_p + gumbel_sample on the candidate set.
+        # gumbel_sample already handles greedy (temp=0) by skipping Gumbel
+        # noise and falling back to argmax, so the same path serves both
+        # all-greedy and mixed/random batches.
+        # Clamp top_k to cand_size: rows with top_k = vocab_size (meaning
+        # "no top_k") would otherwise produce negative gather indices when
+        # cand_size < vocab_size.
+        cand_size = gathered_vals.shape[-1]
+        if top_k is not None:
+            top_k = top_k.to(torch.long).clamp(min=1, max=cand_size).to(torch.int32)
+        gathered_vals = apply_top_k_top_p(gathered_vals, top_k, top_p)
+        sample_pos = gumbel_sample(
+            gathered_vals,
+            expanded_idx_mapping,
+            temperature,
+            seeds,
+            pos,
+            apply_temperature=False,
+            use_fp64=self.use_fp64_gumbel,
+        ).unsqueeze(-1)
+
+        # Map candidate position → global token ID.
+        return gathered_idx.gather(
+            dim=-1, index=sample_pos
+        ).squeeze(-1).to(torch.int64)
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -234,6 +348,32 @@ class Sampler:
             expanded_local_pos,
             skip_top_k_top_p=True,
         )
+
+        # ------------------------------------------------------------------
+        # Reduced sampling path (tensor-parallel optimized).
+        # When enabled and tp_size > 1, logits are shard-local [B, V_local]
+        # (the all-gather in LogitsProcessor was skipped). We perform local
+        # top-k, all-gather only candidates, then sample on the reduced set.
+        # ------------------------------------------------------------------
+        if self.enable_reduce_sample and self.tp_size > 1:
+            top_k, top_p = self.sampling_states.get_top_k_top_p(
+                expanded_idx_mapping, idx_mapping_np
+            )
+            sampled = self._reduce_sample(
+                processed_logits,
+                top_k,
+                top_p,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+            )
+            return sampled, processed_logits
+
+        # ------------------------------------------------------------------
+        # Standard sampling path (full-vocab logits).
+        # ------------------------------------------------------------------
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )

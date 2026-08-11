@@ -31,6 +31,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -108,6 +109,7 @@ from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -357,6 +359,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logprobs_mode=self.model_config.logprobs_mode,
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+                enable_reduce_sample=self.model_config.enable_reduce_sample,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -1140,6 +1143,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _batch_needs_full_logits(self, input_batch: InputBatch) -> bool:
+        """Check whether any request in the batch needs full-vocab logits.
+
+        When enable_reduce_sample is active, logits are shard-local [B, V_local].
+        Some features require the full vocabulary logits and trigger a fallback
+        to a full all-gather:
+          - logit_bias / allowed_token_ids (the bias kernel indexes by global
+            token ID and would go out of bounds on a local shard)
+          - bad_words (the bad words kernel indexes logits by global token ID)
+          - penalties (the penalties kernel compares local positions against
+            global token IDs from output history)
+          - min_p (the kernel computes a threshold from the global max logit;
+            with shard-local logits the threshold would be incorrect)
+          - logprobs requested (compute_topk_scores iterates the full vocab)
+          - logprob_token_ids requested
+        """
+        assert self.sampler is not None
+        idx_mapping_np = input_batch.idx_mapping_np
+        # Logit bias / allowed token IDs: the Triton kernel indexes logits
+        # by global token ID, which is invalid on a local shard.
+        if np.any(self.sampler.logit_bias_state.use_logit_bias[idx_mapping_np]):
+            return True
+        # Bad words: the kernel indexes logits by global token ID.
+        if np.any(
+            self.sampler.bad_words_state.num_bad_words.np[idx_mapping_np] > 0
+        ):
+            return True
+        # Penalties: the kernel compares block positions against global token
+        # IDs from the output history; shard-local logits would miss penalties
+        # for tokens outside the local shard.
+        if np.any(self.sampler.penalties_state.use_penalty[idx_mapping_np]):
+            return True
+        # min_p: the kernel computes threshold = max(logits) + log(min_p).
+        # With shard-local logits, max is local -- the threshold would be
+        # incorrect and could exclude valid candidates on other shards.
+        if np.any(self.sampler.sampling_states.min_p.np[idx_mapping_np] != 0.0):
+            return True
+        # Logprobs: compute_topk_scores needs full-vocab logits.
+        # Logprob token IDs: gathering specific token logprobs needs full vocab.
+        return (
+            self.sampler.sampling_states.max_num_logprobs(idx_mapping_np)
+            != NO_LOGPROBS
+            or self.sampler.logprob_token_ids_state.max_num_token_ids(
+                idx_mapping_np
+            )
+            > 0
+        )
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1148,6 +1199,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+
+        # When enable_reduce_sample is active and tp_size > 1, compute_logits
+        # returns shard-local logits [B, V_local] (the all-gather was skipped
+        # in LogitsProcessor). Certain features require full-vocab logits, so
+        # we perform a full all-gather as a fallback.
+        tp_size = self.parallel_config.tensor_parallel_size
+        if (
+            self.model_config.enable_reduce_sample
+            and tp_size > 1
+            and logits is not None
+        ):
+            needs_full_logits = (
+                grammar_output is not None
+                or (
+                    input_batch.num_draft_tokens > 0
+                    and self.rejection_sampler is not None
+                )
+                or self._batch_needs_full_logits(input_batch)
+            )
+            if needs_full_logits:
+                logits = tensor_model_parallel_all_gather(logits, dim=-1)
+                # Truncate to org_vocab_size to match the non-reduce path.
+                logits = logits[..., : self.vocab_size]
+
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1506,8 +1581,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert self.prompt_logprobs_worker is not None
+        # When enable_reduce_sample is active, compute_logits returns
+        # shard-local logits. Prompt logprobs need full-vocab logits, so wrap
+        # the logits function to perform a full all-gather.
+        if (
+            self.model_config.enable_reduce_sample
+            and self.parallel_config.tensor_parallel_size > 1
+        ):
+            def _full_logits_fn(hs: torch.Tensor) -> torch.Tensor:
+                local_logits = self.model.compute_logits(hs)
+                if local_logits is None:
+                    return None
+                return tensor_model_parallel_all_gather(local_logits, dim=-1)[
+                    ..., : self.vocab_size
+                ]
+        else:
+            _full_logits_fn = self.model.compute_logits
+
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
+            _full_logits_fn,
             hidden_states,
             input_batch,
             self.req_states.all_token_ids.gpu,
