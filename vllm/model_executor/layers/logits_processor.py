@@ -59,8 +59,15 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        # enable_reduce_sample only applies to the target model's LogitsProcessor
+        # (where vocab_size matches the model config's vocab_size). Draft models
+        # with a smaller vocabulary (e.g. EAGLE3's draft_vocab_size) need the
+        # full all-gather for their compute_logits ID-mapping step.
         self.enable_reduce_sample = (
-            model_config.enable_reduce_sample if model_config is not None else False
+            model_config.enable_reduce_sample
+            if model_config is not None
+            and vocab_size == model_config.get_vocab_size()
+            else False
         )
 
     def forward(
